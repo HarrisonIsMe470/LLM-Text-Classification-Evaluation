@@ -127,4 +127,4 @@ GitHub Actions runs the same tests on Python 3.11. The suite covers preprocessin
 
 ## License
 
-MIT License. Author: Haochen.
+MIT License.

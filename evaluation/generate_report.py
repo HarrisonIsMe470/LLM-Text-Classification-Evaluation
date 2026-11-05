@@ -3,6 +3,7 @@
 import argparse
 import html
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -97,14 +98,20 @@ def _alias_mapping_html(labels: List[str], aliases: List[str]) -> str:
     )
 
 
-def _find_edge() -> Path | None:
+def _find_pdf_browser() -> Path | None:
     candidates = [
         Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
         Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+        Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+        Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
     ]
     for path in candidates:
         if path.exists():
             return path
+    for executable in ("msedge", "google-chrome", "chromium", "chromium-browser"):
+        located = shutil.which(executable)
+        if located:
+            return Path(located)
     return None
 
 
@@ -256,6 +263,47 @@ def _write_html(report_html: Path, detailed: Dict[str, object], summary: Dict[st
     report_html.write_text(html_doc, encoding="utf-8")
 
 
+def generate_report(
+    eval_output_dir: Path,
+    report_html: Path,
+    report_pdf: Path,
+    render_pdf: bool = True,
+) -> Path:
+    summary_path = eval_output_dir / "metrics_summary.json"
+    detailed_path = eval_output_dir / "detailed_metrics.json"
+    if not summary_path.exists() or not detailed_path.exists():
+        raise FileNotFoundError(
+            "Missing evaluation outputs. Run evaluation/evaluate_models.py first."
+        )
+
+    summary = _load_json(summary_path)
+    detailed = _load_json(detailed_path)
+
+    report_html.parent.mkdir(parents=True, exist_ok=True)
+    _write_html(report_html, detailed=detailed, summary=summary)
+    print(f"Saved HTML report: {report_html}")
+
+    if not render_pdf:
+        return report_html
+
+    browser_path = _find_pdf_browser()
+    if browser_path is None:
+        print("Chrome/Edge/Chromium not found. Skipped PDF rendering.")
+        return report_html
+
+    report_pdf.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(browser_path),
+        "--headless=new",
+        "--disable-gpu",
+        f"--print-to-pdf={report_pdf}",
+        report_html.resolve().as_uri(),
+    ]
+    subprocess.run(cmd, check=True)
+    print(f"Saved PDF report: {report_pdf}")
+    return report_html
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate Chinese evaluation report HTML/PDF")
     parser.add_argument(
@@ -273,40 +321,19 @@ def main() -> None:
         default=str(PROJECT_ROOT / "evaluation" / "report_zh.pdf"),
         help="Output PDF report path",
     )
+    parser.add_argument(
+        "--render-pdf",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Render PDF with a locally installed Chrome, Edge, or Chromium browser",
+    )
     args = parser.parse_args()
-
-    eval_dir = Path(args.eval_output_dir)
-    summary_path = eval_dir / "metrics_summary.json"
-    detailed_path = eval_dir / "detailed_metrics.json"
-    if not summary_path.exists() or not detailed_path.exists():
-        raise FileNotFoundError(
-            "Missing evaluation outputs. Run evaluation/evaluate_models.py first."
-        )
-
-    summary = _load_json(summary_path)
-    detailed = _load_json(detailed_path)
-
-    report_html = Path(args.report_html)
-    report_html.parent.mkdir(parents=True, exist_ok=True)
-    _write_html(report_html, detailed=detailed, summary=summary)
-    print(f"Saved HTML report: {report_html}")
-
-    report_pdf = Path(args.report_pdf)
-    edge_path = _find_edge()
-    if edge_path is None:
-        print("Edge not found. Skipped PDF rendering.")
-        return
-
-    report_pdf.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        str(edge_path),
-        "--headless=new",
-        "--disable-gpu",
-        f"--print-to-pdf={report_pdf}",
-        report_html.resolve().as_uri(),
-    ]
-    subprocess.run(cmd, check=True)
-    print(f"Saved PDF report: {report_pdf}")
+    generate_report(
+        eval_output_dir=Path(args.eval_output_dir),
+        report_html=Path(args.report_html),
+        report_pdf=Path(args.report_pdf),
+        render_pdf=args.render_pdf,
+    )
 
 
 if __name__ == "__main__":

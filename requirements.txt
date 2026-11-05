@@ -1,10 +1,6 @@
-scikit-learn
-joblib
-transformers
---index-url https://download.pytorch.org/whl/cu121
-torch
-torchvision
-torchaudio
---index-url https://pypi.org/simple
-accelerate
-bitsandbytes
+scikit-learn==1.9.1
+joblib==1.6.0
+torch==2.15.0
+transformers==5.22.1
+accelerate==1.15.0
+bitsandbytes==0.50.2

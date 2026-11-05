@@ -1,178 +1,130 @@
-﻿# 评估传统基线与 LLM 基线在文本分类任务上的表现
+# LLM Text Classification Evaluation
 
-本项目实现一个可复现的文本分类评估流水线，对比以下两类基线在 `20 Newsgroups` 数据集上的分类表现：
-- 传统基线：`TF-IDF + Logistic Regression`
-- LLM 基线：`llm_classifier`（zero-shot，模型：`Qwen/Qwen2.5-1.5B-Instruct`）
+A reproducible evaluation pipeline for comparing two text-classification approaches on the `20 Newsgroups` dataset:
 
-项目当前支持：
-- 训练并使用传统基线进行分类
-- 运行 LLM zero-shot 推理
-- 对 20 类别进行评估（Macro-Precision / Macro-Recall / Macro-F1）
-- 生成评估报告（HTML + PDF）
+- **Supervised classical baseline:** TF-IDF + Logistic Regression trained on the full training split.
+- **Small zero-shot LLM baseline:** `Qwen/Qwen2.5-1.5B-Instruct`, evaluated without task-specific training examples.
 
-`20 Newsgroups` 数据集说明：
-1. 每个样本是一条 Usenet 新闻组帖子文本（邮件/论坛风格文本，包含正文及可能的引用、签名等）。
-2. 共有 `18846` 条样本（训练集 `11314`，测试集 `7532`）。
-3. 标签是 20 个主题新闻组（`alt.atheism`、`comp.graphics`、`comp.os.ms-windows.misc`、`comp.sys.ibm.pc.hardware`、`comp.sys.mac.hardware`、`comp.windows.x`、`misc.forsale`、`rec.autos`、`rec.motorcycles`、`rec.sport.baseball`、`rec.sport.hockey`、`sci.crypt`、`sci.electronics`、`sci.med`、`sci.space`、`soc.religion.christian`、`talk.politics.guns`、`talk.politics.mideast`、`talk.politics.misc`、`talk.religion.misc`）。
-4. 原始数据来自 Usenet 新闻组语料，由 Ken Lang 整理，通过 `sklearn.datasets.fetch_20newsgroups` 加载。
+The project examines quality, invalid-label behavior, latency, and class-level failure patterns under two different learning and cost settings. Because one model receives supervised training while the other is evaluated zero-shot, the results must **not** be interpreted as a fair capability ranking between classical machine learning and LLMs.
 
-## 1. 项目结构
+The main pipeline loads the data, trains the supervised baseline, runs LLM inference, computes unified metrics, and generates an HTML/PDF report.
 
-```text
-.
-├─ main.py
-├─ requirements.txt
-├─ data/
-│  ├─ data_loader.py
-│  └─ raw/
-├─ modeling/
-│  ├─ baseline_tfidf_logreg.py
-│  ├─ llm_classifier.py
-│  └─ configs/
-├─ outputs/
-│  ├─ baseline_tfidf_logreg_results.txt
-│  ├─ results_zero_shot.txt
-│  ├─ llm_predictions_zero_shot.jsonl
-│  └─ llm_raw_outputs_zero_shot.jsonl
-└─ evaluation/
-   ├─ evaluate_models.py
-   ├─ generate_report.py
-   ├─ outputs/
-   └─ report_zh.pdf
-```
+## Reference results
 
-## 2. 环境安装
+The following results came from one full test-split run with `headers`, `footers`, and `quotes` removed:
 
-建议 Python 3.10+。使用以下命令安装本项目依赖
+| Model | Macro-Precision | Macro-Recall | Macro-F1 | Invalid-label rate |
+| --- | ---: | ---: | ---: | ---: |
+| TF-IDF + Logistic Regression | 0.6653 | 0.6469 | 0.6450 | 0% |
+| Qwen2.5-1.5B-Instruct zero-shot | 0.3580 | 0.1865 | 0.2001 | 27.75% |
+
+These values are historical reference results rather than committed runtime artifacts. Each run regenerates its own metrics, predictions, configuration metadata, and timing information.
+
+## Requirements
+
+- Python 3.11 or later.
+- CPU is supported for a small smoke run.
+- An NVIDIA CUDA GPU is recommended for the full LLM evaluation.
+- Direct dependencies are pinned in `requirements.txt`.
+
+GPU users should first install the PyTorch build that matches their driver using the [official PyTorch installer](https://pytorch.org/get-started/locally/), then install the remaining pinned dependencies.
 
 ```bash
-pip install -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-说明：
-- 运行 LLM 推理会调用本地 CUDA 环境。若不支持 CUDA 环境会回退为 CPU 进行推理。
-
-## 3. 运行主流程
-
-主流程会执行：
-1. 加载 `20 Newsgroups` 训练/测试数据
-2. 训练并评估 `tfidf_logreg` 基线
-3. 运行 `llm_classifier` zero-shot 推理
-4. 生成评估报告 `report_zh.pdf`
+The dataset is downloaded by scikit-learn into the Git-ignored `data/cache/` directory. It can also be cached in advance:
 
 ```bash
-python main.py
+python scripts/download_data.py
 ```
 
-常用参数：
-- `--remove {headers,footers,quotes}`：数据去噪选项
-- `--llm-max-test-samples`：LLM 推理样本上限
-- `--llm-max-chars`：单样本输入最大字符数
-- `--llm-max-input-tokens`：LLM tokenizer 截断上限
+## CPU smoke run
 
-可选参数示例：
+This command processes 20 LLM test samples and verifies the complete pipeline without CUDA. The first run downloads the 0.5B model checkpoint.
 
 ```bash
-python main.py --llm-max-test-samples 1000
+python main.py \
+  --remove headers footers quotes \
+  --llm-device cpu \
+  --llm-model Qwen/Qwen2.5-0.5B-Instruct \
+  --llm-max-test-samples 20 \
+  --llm-batch-size 1 \
+  --llm-max-chars 800 \
+  --llm-max-input-tokens 256 \
+  --no-llm-load-in-4bit \
+  --no-render-pdf
 ```
 
-## 4. 输出文件说明
+The smoke run still trains the full TF-IDF baseline, but LLM inference and unified evaluation use the same deterministic 20-sample test subset. This prevents prediction-count mismatches between limited and full runs.
 
-### 4.1 传统基线输出
-- `outputs/baseline_tfidf_logreg_results.txt`：测试结果
-- `modeling/configs/baseline_tfidf_logreg_pipeline.joblib`：已训练模型；可直接复用推理
-- `modeling/configs/run_tfidf_logreg_metadata.json`：运行元数据；超参数；工件路径
+## Full GPU run
 
-`run_tfidf_logreg_metadata.json` 重要参数：
-- `train_size` / `test_size`：训练集与测试集样本量
-- `metrics.accuracy`：基线模型整体准确率
-- `tfidf_params`：向量化核心参数（如 `max_features`、`ngram_range`、`min_df`、`max_df`）
-- `logreg_params`：逻辑回归关键参数（如 `max_iter`、`solver`）
-- `object`：已保存模型可复用对象文件路径（.joblib 格式）
-
-### 4.2 LLM 输出
-- `outputs/results_zero_shot.txt`：accuracy；unknown 占比；耗时统计；输出汇总
-- `outputs/llm_predictions_zero_shot.jsonl`：逐样本预测结果
-- `outputs/llm_raw_outputs_zero_shot.jsonl`：逐样本原始输出
-- `modeling/configs/llm_run_metadata.json`：运行元数据；推理配置；结果路径
-
-`llm_run_metadata.json` 重要参数：
-- `model` / `device` / `load_in_4bit`：所用 LLM、运行设备、是否 4bit 量化加载
-- `max_test_samples` / `batch_size`：推理样本上限与批大小
-- `temperature` / `max_output_tokens`：生成稳定性与输出长度限制
-- `max_chars` / `max_input_tokens`：输入长度截断阈值
-- `zero_shot.accuracy` / `zero_shot.unknown_rate`：zero-shot 核心结果（准确率、unknown 占比）
-- `zero_shot.predictions_path` / `zero_shot.raw_outputs_path`：预测结果与原始输出文件路径
-
-## 5. 统一评估（20 类别）
-
-`evaluation/evaluate_models.py` 模组会对本项目进行统一评估。标准如下：
-- 对 `tfidf_logreg` 与 `llm_classifier` 两个模型分别进行评估
-- 采用涉及权重配比的 `Macro-Precision`、`Macro-Recall`、`Macro-F1` 指标进行比较
-- 生成每个类别（20 类）的 Precision/Recall/F1 与混淆矩阵
-
-单独运行：
+First confirm that `python -c "import torch; print(torch.cuda.is_available())"` prints `True`, then run:
 
 ```bash
-python evaluation/evaluate_models.py
+python main.py \
+  --remove headers footers quotes \
+  --llm-device cuda \
+  --llm-max-test-samples 7532 \
+  --llm-batch-size 32 \
+  --llm-max-chars 1600 \
+  --llm-max-input-tokens 512 \
+  --llm-load-in-4bit
 ```
 
-输出目录：`evaluation/outputs/`
-- `metrics_summary.json`
-- `detailed_metrics.json`
-- `per_class_metrics.csv`
-- `confusion_matrix_tfidf_logreg_20x20.csv`
-- `confusion_matrix_llm_classifier_20x20.csv`
-- `confusion_matrix_llm_classifier_20x21_with_unknown.csv`
+The default device is `auto`: CUDA is used when available, otherwise inference falls back to CPU. The supplied character, token, and batch limits are respected. After a CUDA out-of-memory error, only the current retry batch is reduced.
 
-## 6. 预测结果
+## Generated outputs
 
-下表展示统一评估下两种模型的 Macro 指标：
+Runtime artifacts are excluded by `.gitignore`:
 
-| 模型 | Macro-Precision | Macro-Recall | Macro-F1 |
-| --- | ---: | ---: | ---: |
-| `tfidf_logreg` | 0.6653 | 0.6469 | 0.6450 |
-| `llm_classifier` | 0.3580 | 0.1865 | 0.2001 |
+- `modeling/configs/`: trained models and metadata containing portable project-relative paths.
+- `outputs/`: per-sample LLM predictions, raw model output, and timing summaries.
+- `evaluation/outputs/`: macro metrics, per-class metrics, and confusion matrices.
+- `evaluation/report_zh.html`: always generated.
+- `evaluation/report_zh.pdf`: generated when Chrome, Edge, or Chromium is installed.
 
-### 6.1 项目结论
-
-1. `20 Newsgroups` 数据集属于高维词汇区分明显的主题分类任务，对稀疏词特征友好，线性模型通常较强。  
-2. 传统基线是监督学习，直接在标签上训练，学习到的是该数据集上的判别边界；LLM 使用 zero-shot，没有同等训练参照。  
-3. LLM 模型参数较小（当前为 `1.5B`），出现标签坍缩；具体体现为 `talk.politics.guns`、`talk.politics.mideast`、`talk.politics.misc`、`talk.religion.misc` 大量被预测为 `soc.religion.christian`。  
-4. LLM 存在非正确/错误标签输出（如无法映射标签的输出），等于丢失部分样本；传统基线不存在这类标签映射损失。  
-
-### 6.2 改进方向：传统基线
-
-1. 选择性移除 `headers`、`footers`、`quotes`，对比不同文本清洗策略的输出结果。  
-2. 对 `ngram_range`、`max_df/min_df`、`max_features`、`sublinear_tf`、tokenization 做强基线调参。  
-3. 对比更强线性分类模型，如 `LinearSVC` 与 `SGDClassifier`。  
-
-### 6.3 改进方向：LLM 模型
-
-1. 使用更高参数模型（当前模型为 `1.5B`）。  
-2. 做 SFT 微调，将任务明确为“输入一段文本 -> 输出 20 个类别中的一个”。  
-3. 先粗分类（`comp/rec/sci/talk/soc/misc/alt`），再在组内细分，减少语义塌缩。  
-4. 同一样本多次采样后投票。  
-
-## 7. 生成中文评估报告（PDF）
-
-通过 `evaluation/generate_report.py` 生成PDF格式报告。报告内容包括：
-- 数据集说明
-- baseline 说明
-- 配置说明
-- 全流程结构（pipeline）
-- 输出说明
-- 指标选择说明
-- 混淆矩阵与误差分析
-
-单独运行：
+Individual stages can also be run separately:
 
 ```bash
+python modeling/baseline_tfidf_logreg.py --remove headers footers quotes
+python modeling/llm_classifier.py --remove headers footers quotes --device auto
+python evaluation/evaluate_models.py --remove headers footers quotes
 python evaluation/generate_report.py
 ```
 
-## 8. 作者与开源声明
+## Testing and CI
 
-- 项目作者：`Haochen`
-- 开源协议：`MIT License`
-- 使用说明：任何人均可下载、运行本项目，并在遵守 MIT License 条款的前提下使用、复制、修改与分发。
+The lightweight test suite does not download the dataset or model:
+
+```bash
+python -m pip install -r requirements-ci.txt
+python -m pytest -q
+```
+
+GitHub Actions runs the same tests on Python 3.11. The suite covers preprocessing arguments, CPU fallback, batch and token limits, portable artifact paths, subset-aligned evaluation, and main-pipeline orchestration.
+
+## Project structure
+
+```text
+.
+├── main.py
+├── data/data_loader.py
+├── modeling/
+│   ├── baseline_tfidf_logreg.py
+│   └── llm_classifier.py
+├── evaluation/
+│   ├── evaluate_models.py
+│   └── generate_report.py
+├── scripts/download_data.py
+├── tests/
+└── .github/workflows/ci.yml
+```
+
+## License
+
+MIT License. Author: Haochen.

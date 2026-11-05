@@ -5,7 +5,7 @@ import csv
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import joblib
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
@@ -132,62 +132,62 @@ def _write_matrix_csv(path: Path, label_names: Sequence[str], matrix: Sequence[S
             writer.writerow([label_names[idx], *row])
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Evaluate TF-IDF+LogReg and LLM classifier with macro Precision/Recall/F1 "
-            "and per-class metrics over all 20 categories."
-        )
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=str(PROJECT_ROOT / "evaluation" / "outputs"),
-        help="Directory to save evaluation objects",
-    )
-    parser.add_argument(
-        "--baseline-metadata",
-        default=str(PROJECT_ROOT / "modeling" / "configs" / "run_tfidf_logreg_metadata.json"),
-        help="Path to baseline metadata JSON",
-    )
-    parser.add_argument(
-        "--llm-metadata",
-        default=str(PROJECT_ROOT / "modeling" / "configs" / "llm_run_metadata.json"),
-        help="Path to LLM metadata JSON",
-    )
-    parser.add_argument(
-        "--llm-predictions",
-        default="",
-        help="Optional override for LLM predictions JSONL path",
-    )
-    args = parser.parse_args()
+def _resolve_artifact_path(value: object) -> Path:
+    path = Path(str(value))
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
-    output_dir = Path(args.output_dir)
+
+def _portable_path(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def evaluate_models(
+    output_dir: Path,
+    baseline_metadata_path: Path,
+    llm_metadata_path: Path,
+    llm_predictions_path: Optional[Path] = None,
+    remove: Sequence[str] = (),
+    max_test_samples: Optional[int] = None,
+    test_dataset=None,
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    test_dataset = load_20newsgroups(subset="test", remove=())
-    y_true = list(test_dataset.target)
+    if test_dataset is None:
+        test_dataset = load_20newsgroups(subset="test", remove=remove)
+    sample_count = len(test_dataset.data)
+    if max_test_samples is not None:
+        if max_test_samples <= 0:
+            raise ValueError("max_test_samples must be a positive integer or None")
+        sample_count = min(max_test_samples, sample_count)
+
+    test_data = list(test_dataset.data[:sample_count])
+    y_true = list(test_dataset.target[:sample_count])
     label_names = list(test_dataset.target_names)
     label_to_idx = {name: idx for idx, name in enumerate(label_names)}
 
-    baseline_metadata = _load_json(Path(args.baseline_metadata))
+    baseline_metadata = _load_json(baseline_metadata_path)
     baseline_object = baseline_metadata.get("object")
     if not baseline_object:
         raise KeyError("Baseline metadata must contain 'object' field.")
-    baseline_pipeline_path = Path(str(baseline_object["pipeline"]))
+    baseline_pipeline_path = _resolve_artifact_path(baseline_object["pipeline"])
     baseline_pipeline = joblib.load(baseline_pipeline_path)
-    baseline_pred = list(baseline_pipeline.predict(test_dataset.data))
+    baseline_pred = list(baseline_pipeline.predict(test_data))
 
-    llm_predictions_path: Path
-    if args.llm_predictions:
-        llm_predictions_path = Path(args.llm_predictions)
-    else:
-        llm_metadata = _load_json(Path(args.llm_metadata))
-        llm_predictions_path = Path(str(llm_metadata["zero_shot"]["predictions_path"]))
+    if llm_predictions_path is None:
+        llm_metadata = _load_json(llm_metadata_path)
+        llm_predictions_path = _resolve_artifact_path(
+            llm_metadata["zero_shot"]["predictions_path"]
+        )
     llm_pred = _read_llm_predictions(llm_predictions_path, label_to_idx)
 
     if len(llm_pred) != len(y_true):
         raise ValueError(
-            f"LLM prediction count ({len(llm_pred)}) does not match test set size ({len(y_true)})."
+            f"LLM prediction count ({len(llm_pred)}) does not match selected test "
+            f"sample count ({len(y_true)})."
         )
 
     baseline_eval = _evaluate("tfidf_logreg", y_true, baseline_pred, label_names)
@@ -198,6 +198,7 @@ def main() -> None:
             "name": "20 Newsgroups",
             "num_categories": len(label_names),
             "num_test_samples": len(y_true),
+            "remove": list(remove),
             "categories": label_names,
         },
         "models": {
@@ -217,8 +218,8 @@ def main() -> None:
             },
         },
         "object": {
-            "baseline_pipeline": str(baseline_pipeline_path),
-            "llm_predictions": str(llm_predictions_path),
+            "baseline_pipeline": _portable_path(baseline_pipeline_path),
+            "llm_predictions": _portable_path(llm_predictions_path),
         },
     }
 
@@ -270,6 +271,58 @@ def main() -> None:
     print(f"Saved: {summary_path}")
     print(f"Saved: {detailed_path}")
     print(f"Saved: {output_dir / 'per_class_metrics.csv'}")
+    return summary_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate TF-IDF+LogReg and LLM classifier with macro Precision/Recall/F1 "
+            "and per-class metrics over all 20 categories."
+        )
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(PROJECT_ROOT / "evaluation" / "outputs"),
+        help="Directory to save evaluation objects",
+    )
+    parser.add_argument(
+        "--baseline-metadata",
+        default=str(PROJECT_ROOT / "modeling" / "configs" / "run_tfidf_logreg_metadata.json"),
+        help="Path to baseline metadata JSON",
+    )
+    parser.add_argument(
+        "--llm-metadata",
+        default=str(PROJECT_ROOT / "modeling" / "configs" / "llm_run_metadata.json"),
+        help="Path to LLM metadata JSON",
+    )
+    parser.add_argument(
+        "--llm-predictions",
+        default="",
+        help="Optional override for LLM predictions JSONL path",
+    )
+    parser.add_argument(
+        "--remove",
+        nargs="*",
+        default=[],
+        choices=["headers", "footers", "quotes"],
+        help="Elements removed when loading the test split",
+    )
+    parser.add_argument(
+        "--max-test-samples",
+        type=int,
+        default=None,
+        help="Evaluate only the first N deterministic test samples",
+    )
+    args = parser.parse_args()
+    evaluate_models(
+        output_dir=Path(args.output_dir),
+        baseline_metadata_path=Path(args.baseline_metadata),
+        llm_metadata_path=Path(args.llm_metadata),
+        llm_predictions_path=Path(args.llm_predictions) if args.llm_predictions else None,
+        remove=args.remove,
+        max_test_samples=args.max_test_samples,
+    )
 
 
 if __name__ == "__main__":

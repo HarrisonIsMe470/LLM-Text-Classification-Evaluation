@@ -18,6 +18,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 
 
+def _artifact_path(path: Path) -> str:
+    """Store portable project-relative paths in run metadata."""
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
 def _default_tfidf_params() -> Dict[str, Any]:
     return {
         "max_features": 20000,
@@ -107,9 +116,9 @@ def train_and_evaluate(
         },
         "logreg_params": logreg_params,
         "object": {
-            "pipeline": str(pipeline_path),
-            "vectorizer": str(vectorizer_path),
-            "logreg": str(logreg_path),
+            "pipeline": _artifact_path(pipeline_path),
+            "vectorizer": _artifact_path(vectorizer_path),
+            "logreg": _artifact_path(logreg_path),
         },
     }
 
@@ -119,7 +128,7 @@ def train_and_evaluate(
         handle.write(f"train_size={metadata['train_size']}\n")
         handle.write(f"test_size={metadata['test_size']}\n")
         handle.write(f"accuracy={accuracy:.4f}\n")
-    metadata["results_txt_path"] = str(results_txt_path)
+    metadata["results_txt_path"] = _artifact_path(results_txt_path)
 
     metadata_path = metadata_dir / "run_tfidf_logreg_metadata.json"
     with metadata_path.open("w", encoding="utf-8") as handle:
@@ -143,7 +152,7 @@ def main() -> None:
     parser.add_argument(
         "--remove",
         nargs="*",
-        default=[],
+        default=["headers", "footers", "quotes"],
         choices=["headers", "footers", "quotes"],
         help="Elements to remove from the text",
     )

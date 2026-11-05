@@ -1,0 +1,17 @@
+.DS_Store
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Downloaded datasets and generated experiment artifacts
+data/cache/
+data/raw/
+outputs/*
+!outputs/.gitkeep
+modeling/configs/*.joblib
+modeling/configs/*_metadata.json
+evaluation/outputs/*
+!evaluation/outputs/.gitkeep
+evaluation/report_*.html
+evaluation/report_*.pdf

@@ -10,16 +10,52 @@ from pathlib import Path
 from time import perf_counter
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import torch
 from sklearn.utils import Bunch
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-)
-from transformers.utils import logging as hf_logging
+
+try:
+    import torch
+except ImportError:  # Allows lightweight unit tests without the LLM runtime.
+    torch = None
+
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers.utils import logging as hf_logging
+except ImportError:  # Allows lightweight unit tests without the LLM runtime.
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
+    BitsAndBytesConfig = None
+    hf_logging = None
 
 from data.data_loader import load_20newsgroups
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _artifact_path(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def _require_llm_runtime() -> None:
+    if torch is None or AutoTokenizer is None or AutoModelForCausalLM is None:
+        raise RuntimeError(
+            "LLM dependencies are missing. Install the pinned requirements with "
+            "'python -m pip install -r requirements.txt'."
+        )
+
+
+def _resolve_device(requested: str, cuda_available: bool) -> str:
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise ValueError("device must be one of: auto, cpu, cuda")
+    if requested == "cuda" and not cuda_available:
+        raise RuntimeError("CUDA was requested but is not available.")
+    if requested == "auto":
+        return "cuda" if cuda_available else "cpu"
+    return requested
 
 
 def _log(message: str) -> None:
@@ -200,8 +236,9 @@ def _configure_hf_console(quiet_hf: bool) -> None:
         return
     os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-    hf_logging.set_verbosity_error()
-    hf_logging.disable_progress_bar()
+    if hf_logging is not None:
+        hf_logging.set_verbosity_error()
+        hf_logging.disable_progress_bar()
     warnings.filterwarnings("ignore", message=r".*torch_dtype.*deprecated.*")
     warnings.filterwarnings("ignore", message=r".*Both `max_new_tokens`.*")
     warnings.filterwarnings(
@@ -214,19 +251,25 @@ def _configure_hf_console(quiet_hf: bool) -> None:
     )
 
 
-def _report_torch_runtime() -> bool:
+def _report_torch_runtime(requested_device: str) -> str:
+    _require_llm_runtime()
     cuda_available = torch.cuda.is_available()
     cuda_build = torch.version.cuda or "cpu-only"
     _log(f"[llm] torch={torch.__version__}, torch_cuda_build={cuda_build}")
-    if cuda_available:
+    resolved_device = _resolve_device(requested_device, cuda_available)
+    if resolved_device == "cuda":
         device_name = torch.cuda.get_device_name(0)
         _log(f"[llm] CUDA is available. Using GPU: {device_name}")
     else:
-        _log("[llm] CUDA is not available. Falling back to CPU.")
-    return cuda_available
+        if requested_device == "auto" and not cuda_available:
+            _log("[llm] CUDA is not available. Falling back to CPU.")
+        else:
+            _log("[llm] Using CPU as requested.")
+    return resolved_device
 
 
-def _build_generator(model_name: str, load_in_4bit: bool, gpu_only: bool):
+def _build_generator(model_name: str, load_in_4bit: bool, device: str):
+    _require_llm_runtime()
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
     if not hf_token:
         _log(
@@ -248,10 +291,9 @@ def _build_generator(model_name: str, load_in_4bit: bool, gpu_only: bool):
     model_kwargs = {
         "trust_remote_code": True,
     }
-    if torch.cuda.is_available():
+    if device == "cuda":
         model_kwargs["dtype"] = torch.float16
-        # Keep weights strictly on GPU to avoid CPU/shared-memory spillover.
-        model_kwargs["device_map"] = {"": 0} if gpu_only else "auto"
+        model_kwargs["device_map"] = {"": 0}
         if load_in_4bit:
             try:
                 quant_config = BitsAndBytesConfig(
@@ -264,12 +306,9 @@ def _build_generator(model_name: str, load_in_4bit: bool, gpu_only: bool):
             except Exception as exc:
                 print(f"[warning] 4-bit quantization setup failed, falling back: {exc}")
     else:
-        if gpu_only:
-            raise RuntimeError(
-                "gpu_only=True but CUDA is unavailable. "
-                "Install CUDA-enabled PyTorch and ensure GPU is visible."
-            )
         model_kwargs["dtype"] = torch.float32
+        if load_in_4bit:
+            _log("[llm] 4-bit loading is disabled on CPU for portable smoke runs.")
 
     _log("[llm] Loading model weights (first run may take several minutes)...")
     try:
@@ -297,6 +336,7 @@ def _generate_label(
     prompt: str,
     temperature: float,
     max_new_tokens: int,
+    max_input_tokens: int,
 ) -> str:
     return _generate_labels_batch(
         tokenizer=tokenizer,
@@ -305,6 +345,7 @@ def _generate_label(
         temperature=temperature,
         max_new_tokens=max_new_tokens,
         batch_size=1,
+        max_input_tokens=max_input_tokens,
     )[0]
 
 
@@ -348,7 +389,7 @@ def _generate_labels_batch(
         decoded = tokenizer.batch_decode(
             continuation,
             skip_special_tokens=True,
-            clean_up_tokenization_spaces=True,
+            clean_up_tokenization_spaces=False,
         )
         results.extend([text.strip() for text in decoded])
     return results
@@ -458,7 +499,7 @@ def _evaluate(
         for value in prompt_token_lengths
     ]
     abnormal_count = sum(1 for marked in marked_abnormal if marked)
-    normal_batch_size = 32
+    normal_batch_size = max(1, batch_size)
     _log(
         f"[llm][{eval_name}] length distribution: "
         f"mean={mean_prompt_tokens:.2f}, std={std_prompt_tokens:.2f}, "
@@ -480,7 +521,7 @@ def _evaluate(
                 and any(marked_abnormal[processed_samples : processed_samples + step_batch_size])
             ):
                 step_batch_size -= 1
-            step_mode = "normal-32"
+            step_mode = f"normal-{normal_batch_size}"
 
         retry_batch_size = step_batch_size
         retry_max_input_tokens = max_input_tokens
@@ -689,7 +730,7 @@ def _build_timing_metrics(total_seconds: float, sample_count: int) -> Dict[str, 
 
 
 def run_llm_baseline(
-    max_test_samples: int = 1000,
+    max_test_samples: Optional[int] = None,
     max_chars: int = 1600,
     temperature: float = 0.0,
     max_output_tokens: int = 16,
@@ -700,13 +741,17 @@ def run_llm_baseline(
     batch_size: int = 32,
     token_monitor_every: int = 20,
     quiet_hf: bool = True,
-    gpu_only: bool = True,
+    device: str = "auto",
     max_input_tokens: int = 512,
     remove: Sequence[str] = ("headers", "footers", "quotes"),
     test_dataset: Optional[Bunch] = None,
 ) -> Path:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if max_input_tokens <= 0:
+        raise ValueError("max_input_tokens must be positive")
     _configure_hf_console(quiet_hf=quiet_hf)
-    cuda_available = _report_torch_runtime()
+    resolved_device = _report_torch_runtime(device)
 
     if output_dir is None:
         output_dir = Path(__file__).resolve().parents[1] / "outputs"
@@ -715,14 +760,18 @@ def run_llm_baseline(
 
     tokenizer, model_instance = _build_generator(
         model_name=model,
-        load_in_4bit=load_in_4bit,
-        gpu_only=gpu_only,
+        load_in_4bit=load_in_4bit and resolved_device == "cuda",
+        device=resolved_device,
     )
 
     if test_dataset is None:
         test_dataset = load_20newsgroups(subset="test", remove=remove)
 
-    max_samples = min(max_test_samples, len(test_dataset.data))
+    max_samples = len(test_dataset.data)
+    if max_test_samples is not None:
+        if max_test_samples <= 0:
+            raise ValueError("max_test_samples must be a positive integer or None")
+        max_samples = min(max_test_samples, max_samples)
     test_texts = list(test_dataset.data[:max_samples])
     test_targets = list(test_dataset.target[:max_samples])
     label_names = list(test_dataset.target_names)
@@ -735,8 +784,8 @@ def run_llm_baseline(
         "platform": "huggingface",
         "framework": "transformers",
         "model": model,
-        "device": "cuda" if cuda_available else "cpu",
-        "load_in_4bit": load_in_4bit,
+        "device": resolved_device,
+        "load_in_4bit": load_in_4bit and resolved_device == "cuda",
         "max_test_samples": max_samples,
         "temperature": temperature,
         "max_output_tokens": max_output_tokens,
@@ -744,7 +793,6 @@ def run_llm_baseline(
         "batch_size": batch_size,
         "token_monitor_every": token_monitor_every,
         "quiet_hf": quiet_hf,
-        "gpu_only": gpu_only,
         "max_input_tokens": max_input_tokens,
         "remove": list(remove),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -753,26 +801,13 @@ def run_llm_baseline(
     _log(f"\n[llm][zero-shot] Starting evaluation on {max_samples} samples...")
     zero_shot_start = perf_counter()
     zero_shot_builder = lambda text: _build_zero_shot_prompt(text, label_names)
-    (
-        effective_max_chars,
-        effective_max_input_tokens,
-        zero_shot_prompts_prebuilt,
-        zero_shot_prompt_token_lengths,
-        limit_interval_stats,
-    ) = _resolve_effective_input_limits(
-        tokenizer=tokenizer,
-        texts=test_texts,
-        prompt_builder=zero_shot_builder,
-    )
-    _log(
-        "[llm][zero-shot] dynamic limits resolved: "
-        f"max_chars={effective_max_chars}, "
-        f"max_input_tokens={effective_max_input_tokens}"
-    )
-    _log(
-        "[llm][zero-shot] 95% intervals: "
-        f"max_chars_interval=[{limit_interval_stats['chars_interval_low']:.2f}, {limit_interval_stats['chars_interval_high']:.2f}], "
-        f"max_input_tokens_interval=[{limit_interval_stats['tokens_interval_low']:.2f}, {limit_interval_stats['tokens_interval_high']:.2f}]"
+    effective_max_chars = max_chars
+    effective_max_input_tokens = max_input_tokens
+    zero_shot_prompts_prebuilt = [
+        zero_shot_builder(_truncate(text, effective_max_chars)) for text in test_texts
+    ]
+    zero_shot_prompt_token_lengths = _estimate_tokens_chunked(
+        tokenizer, zero_shot_prompts_prebuilt, chunk_size=256
     )
     if zero_shot_prompt_token_lengths:
         max_token_idx = max(
@@ -787,16 +822,6 @@ def run_llm_baseline(
             f"estimated_prompt_tokens={max_token_count}, "
             f"prompt_chars={max_token_prompt_chars}"
         )
-    results["requested_max_chars"] = max_chars
-    results["requested_max_input_tokens"] = max_input_tokens
-    results["max_chars"] = effective_max_chars
-    results["max_input_tokens"] = effective_max_input_tokens
-    results["max_chars_interval_95pct_low"] = limit_interval_stats["chars_interval_low"]
-    results["max_chars_interval_95pct_high"] = limit_interval_stats["chars_interval_high"]
-    results["max_chars_interval_95pct_count"] = int(limit_interval_stats["chars_in_interval_count"])
-    results["max_input_tokens_interval_95pct_low"] = limit_interval_stats["tokens_interval_low"]
-    results["max_input_tokens_interval_95pct_high"] = limit_interval_stats["tokens_interval_high"]
-    results["max_input_tokens_interval_95pct_count"] = int(limit_interval_stats["tokens_in_interval_count"])
     zero_shot_metrics, zero_shot_predictions, zero_shot_raw_outputs, zero_shot_prompts = _evaluate(
         tokenizer=tokenizer,
         model=model_instance,
@@ -839,9 +864,9 @@ def run_llm_baseline(
     results["zero_shot"] = {
         **zero_shot_metrics,
         **zero_shot_timing,
-        "predictions_path": str(zero_shot_path),
-        "raw_outputs_path": str(zero_shot_raw_path),
-        "results_txt_path": str(zero_shot_results_txt_path),
+        "predictions_path": _artifact_path(zero_shot_path),
+        "raw_outputs_path": _artifact_path(zero_shot_raw_path),
+        "results_txt_path": _artifact_path(zero_shot_results_txt_path),
     }
     _append_results_text(
         path=zero_shot_results_txt_path,
@@ -893,8 +918,8 @@ def main() -> None:
     parser.add_argument(
         "--max-test-samples",
         type=int,
-        default=1000,
-        help="Limit evaluation samples",
+        default=None,
+        help="Limit evaluation samples; defaults to the full test split",
     )
     parser.add_argument(
         "--max-chars",
@@ -944,10 +969,10 @@ def main() -> None:
         help="Suppress non-actionable Hugging Face/Transformers logs for cleaner output",
     )
     parser.add_argument(
-        "--gpu-only",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Keep model strictly on GPU; fail on OOM instead of CPU/shared-memory offload",
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Inference device. 'auto' uses CUDA when available, otherwise CPU.",
     )
     parser.add_argument(
         "--max-input-tokens",
@@ -967,7 +992,7 @@ def main() -> None:
         batch_size=args.batch_size,
         token_monitor_every=args.token_monitor_every,
         quiet_hf=args.quiet_hf,
-        gpu_only=args.gpu_only,
+        device=args.device,
         max_input_tokens=args.max_input_tokens,
         remove=args.remove,
     )
